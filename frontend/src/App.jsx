@@ -3,6 +3,36 @@ import './App.css'
 
 function App() {
   const [text, setText] = useState('')
+  const [result, setResult] = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  const checkGrammar = async () => {
+    if (!text.trim()) return
+
+    setLoading(true)
+
+    try {
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`Backend returned ${response.status}`)
+      }
+
+      const data = await response.json()
+      setResult(data)
+    } catch (error) {
+      console.error(error)
+      setResult({ message: 'Could not connect to backend' })
+    } finally {
+      setLoading(false)
+    }
+  }
 
   return (
     <div className="app">
@@ -34,8 +64,8 @@ function App() {
           <div className="editor-footer">
             <span>{text.length} characters</span>
 
-            <button>
-              Check Grammar
+            <button onClick={checkGrammar} disabled={loading}>
+              {loading ? 'Checking...' : 'Check Grammar'}
             </button>
           </div>
         </div>
@@ -43,26 +73,35 @@ function App() {
         <div className="suggestions">
           <h2>Suggestions</h2>
 
-          <div className="suggestion-stats">
-            <div>
-              <strong>Grammar</strong>
-              <span>0 issues</span>
+          {result ? (
+            <div className="empty-state">
+              <p>{result.message}</p>
+              {result.text && <p>{result.text}</p>}
             </div>
+          ) : (
+            <>
+              <div className="suggestion-stats">
+                <div>
+                  <strong>Grammar</strong>
+                  <span>0 issues</span>
+                </div>
 
-            <div>
-              <strong>Spelling</strong>
-              <span>0 issues</span>
-            </div>
+                <div>
+                  <strong>Spelling</strong>
+                  <span>0 issues</span>
+                </div>
 
-            <div>
-              <strong>Clarity</strong>
-              <span>—</span>
-            </div>
-          </div>
+                <div>
+                  <strong>Clarity</strong>
+                  <span>—</span>
+                </div>
+              </div>
 
-          <div className="empty-state">
-            <p>Your writing suggestions will appear here.</p>
-          </div>
+              <div className="empty-state">
+                <p>Your writing suggestions will appear here.</p>
+              </div>
+            </>
+          )}
         </div>
       </main>
     </div>
