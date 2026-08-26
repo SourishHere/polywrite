@@ -25,6 +25,41 @@ function App() {
     }
   }
 
+  const applyCorrection = (issue) => {
+    setText((current) => current.replace(issue.original, issue.suggestion))
+    setResult((current) => {
+      if (!current?.issues) return current
+      const updatedIssues = current.issues.filter((item) => item !== issue)
+      return {
+        ...current,
+        issues: updatedIssues,
+        corrected_text: current.corrected_text?.replace(issue.original, issue.suggestion),
+        counts: {
+          ...current.counts,
+          [issue.type]: Math.max(0, current.counts?.[issue.type] - 1),
+          total: Math.max(0, current.counts?.total - 1),
+        },
+        message: updatedIssues.length === 0 ? 'Analysis complete — no remaining issues' : current.message,
+      }
+    })
+  }
+
+  const applyAllCorrections = () => {
+    if (!result?.issues?.length) return
+    let corrected = text
+    result.issues.forEach((issue) => {
+      corrected = corrected.replace(issue.original, issue.suggestion)
+    })
+    setText(corrected)
+    setResult((current) => ({
+      ...current,
+      corrected_text: corrected,
+      issues: [],
+      counts: { grammar: 0, spelling: 0, clarity: 0, total: 0 },
+      message: 'All corrections applied',
+    }))
+  }
+
   const clearResult = () => setResult(null)
   const counts = result?.counts || { grammar: 0, spelling: 0, clarity: 0 }
 
@@ -61,7 +96,13 @@ function App() {
         </div>
 
         <div className="suggestions">
-          <h2>Suggestions</h2>
+          <div className="suggestions-title">
+            <h2>Suggestions</h2>
+            {result?.issues?.length > 0 && (
+              <button className="apply-all" onClick={applyAllCorrections}>Apply all</button>
+            )}
+          </div>
+
           {!result ? (
             <>
               <div className="suggestion-stats">
@@ -79,19 +120,22 @@ function App() {
                 <div><strong>Clarity</strong><span>{counts.clarity} {counts.clarity === 1 ? 'issue' : 'issues'}</span></div>
               </div>
 
-              <div className="empty-state">
-                <p><strong>{result.message}</strong></p>
-                <p><strong>Corrected text:</strong> {result.corrected_text}</p>
+              <div className="corrected-box">
+                <div className="corrected-header"><strong>Corrected text</strong></div>
+                <p>{result.corrected_text || result.text}</p>
               </div>
 
               {result.issues.length === 0 ? (
-                <div className="empty-state"><p>✓ Your text looks good!</p></div>
+                <div className="empty-state success-state"><p>✓ {result.message || 'Your text looks good!'}</p></div>
               ) : (
                 <div className="issue-list">
                   {result.issues.map((issue, index) => (
                     <div className="issue" key={`${issue.original}-${index}`}>
-                      <span className="issue-type">{issue.type}</span>
-                      <p><strong>{issue.original}</strong> → <strong>{issue.suggestion}</strong></p>
+                      <div className="issue-top">
+                        <span className="issue-type">{issue.type}</span>
+                        <button className="apply-button" onClick={() => applyCorrection(issue)}>Apply</button>
+                      </div>
+                      <p><strong>{issue.original}</strong> <span className="arrow">→</span> <strong>{issue.suggestion}</strong></p>
                       <small>{issue.explanation}</small>
                     </div>
                   ))}
