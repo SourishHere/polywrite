@@ -12,7 +12,7 @@ class TextRequest(BaseModel):
 
 tool = language_tool_python.LanguageTool("en-US")
 
-# Names/places that should not be treated as spelling mistakes.
+# Known names/places/technical terms that should never be treated as spelling mistakes.
 PROPER_NOUNS = {
     "sourish": "Sourish", "vellore": "Vellore", "india": "India",
     "chennai": "Chennai", "tamil nadu": "Tamil Nadu", "vit": "VIT",
@@ -21,7 +21,6 @@ PROPER_NOUNS = {
 
 
 def protect_names(text):
-    """Replace known names with safe alphabetic tokens, then restore them later."""
     protected = text
     replacements = {}
     for index, (name, proper) in enumerate(sorted(PROPER_NOUNS.items(), key=lambda x: -len(x[0]))):
@@ -43,32 +42,44 @@ def custom_rules(text):
     issues = []
     corrected = text
 
+    # High-confidence rules that LanguageTool may miss in short learner sentences.
     rules = [
         (r"\bI\s+from\s+([A-Za-z]+)\b", lambda m: f"I am from {m.group(1)}", "Use 'am' after I when stating where you are from."),
-        (r"\b(he|she)\s+from\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} is from {m.group(2)}", "Use 'is' after he/she when stating where someone is from."),
+        (r"\b(he|she|it)\s+from\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} is from {m.group(2)}", "Use 'is' after he/she/it when stating where someone is from."),
         (r"\bI\s+a\s+([A-Za-z]+)\b", lambda m: f"I am a {m.group(1)}", "Use 'am' after I."),
-        (r"\b(he|she)\s+a\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} is a {m.group(2)}", "Use 'is' after he/she."),
+        (r"\b(he|she|it)\s+a\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} is a {m.group(2)}", "Use 'is' after he/she/it."),
         (r"\bmy\s+name\s+([A-Za-z]+)\b", lambda m: f"my name is {m.group(1)}", "Use 'is' in the expression 'my name is ...'."),
+        (r"\b(he|she|it)\s+dont\b", lambda m: f"{m.group(1)} doesn't", "Use 'doesn't' with he/she/it."),
+        (r"\b(I|you|we|they)\s+dont\b", lambda m: f"{m.group(1)} don't", "Use 'don't' with I/you/we/they."),
+        (r"\b(he|she|it)\s+have\b", lambda m: f"{m.group(1)} has", "Use 'has' with he/she/it."),
+        (r"\b(he|she|it)\s+do\b", lambda m: f"{m.group(1)} does", "Use 'does' with he/she/it."),
+        (r"\b(I|you|we|they)\s+does\b", lambda m: f"{m.group(1)} do", "Use 'do' with I/you/we/they."),
+        (r"\b(he|she|it)\s+is\s+([A-Za-z]+)s\b", lambda m: f"{m.group(1)} is {m.group(2)}", "Check singular/plural agreement."),
+        (r"\b(I|you|we|they)\s+was\b", lambda m: f"{m.group(1)} were", "Use 'were' with this subject."),
+        (r"\b(he|she|it)\s+were\b", lambda m: f"{m.group(1)} was", "Use 'was' with he/she/it."),
+        (r"\bmany\s+([A-Za-z]+)\b", lambda m: f"many {m.group(1)}s" if not m.group(1).lower().endswith("s") else m.group(0), "Use a plural countable noun after 'many'."),
     ]
 
     for pattern, make_suggestion, explanation in rules:
         match = re.search(pattern, corrected, re.IGNORECASE)
-        if match:
-            original = match.group(0)
-            suggestion = make_suggestion(match)
-            # Preserve sentence-start capitalization.
-            if original[0].isupper():
-                suggestion = suggestion[0].upper() + suggestion[1:]
-            issues.append({
-                "type": "grammar",
-                "original": original,
-                "suggestion": suggestion,
-                "explanation": explanation,
-                "rule": "POLYWRITE_CUSTOM_GRAMMAR",
-            })
-            corrected = corrected[:match.start()] + suggestion + corrected[match.end():]
+        if not match:
+            continue
+        suggestion = make_suggestion(match)
+        original = match.group(0)
+        if suggestion.lower() == original.lower():
+            continue
+        if original[0].isupper():
+            suggestion = suggestion[0].upper() + suggestion[1:]
+        issues.append({
+            "type": "grammar",
+            "original": original,
+            "suggestion": suggestion,
+            "explanation": explanation,
+            "rule": "POLYWRITE_CUSTOM_GRAMMAR",
+        })
+        corrected = corrected[:match.start()] + suggestion + corrected[match.end():]
 
-    # Capitalize sentence starts and the pronoun I before LanguageTool runs.
+    # Capitalization fixes are corrections, not spelling errors.
     corrected = re.sub(r"(^|(?<=[.!?])\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), corrected)
     corrected = re.sub(r"\bi\b", "I", corrected)
     return issues, corrected
@@ -76,8 +87,6 @@ def custom_rules(text):
 
 def analyze_english(text: str):
     custom_issues, custom_corrected = custom_rules(text)
-
-    # Protect known names/places from LanguageTool spelling corrections.
     protected, replacements = protect_names(custom_corrected)
     matches = tool.check(protected)
     corrected = language_tool_python.utils.correct(protected, matches)
@@ -92,7 +101,7 @@ def analyze_english(text: str):
 
         rule_id = getattr(match, "ruleId", "") or ""
         category = (getattr(match, "category", "") or "").upper()
-        if "TYPOS" in category or "SPELL" in rule_id.upper() or "MORFOLOGIK" in rule_id.upper() or "I_LOWERCASE" in rule_id.upper():
+        if "TYPOS" in category or "SPELL" in rule_id.upper() or "MORFOLOGIK" in rule_id.upper():
             issue_type = "spelling"
         elif "STYLE" in category or "STYLE" in rule_id.upper() or "REDUND" in rule_id.upper():
             issue_type = "clarity"
@@ -107,11 +116,10 @@ def analyze_english(text: str):
             "rule": rule_id,
         })
 
-    # Always restore/correct known proper nouns in the final output.
     corrected = restore_names(corrected, replacements)
     corrected = re.sub(r"\bi\b", "I", corrected)
 
-    # Add clarity warning for very long sentences.
+    # Flag very long sentences as a clarity issue.
     for sentence in re.split(r"[.!?]+", text):
         if len(re.findall(r"\b[\w']+\b", sentence)) > 35:
             issues.append({
@@ -123,7 +131,7 @@ def analyze_english(text: str):
             })
             break
 
-    # Remove duplicate findings.
+    # De-duplicate findings.
     unique = []
     seen = set()
     for issue in issues:
