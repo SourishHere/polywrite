@@ -12,92 +12,118 @@ class TextRequest(BaseModel):
 
 tool = language_tool_python.LanguageTool("en-US")
 
-# Names and places that should not be treated as spelling mistakes.
+# Names/places that should not be treated as spelling mistakes.
 PROPER_NOUNS = {
     "sourish": "Sourish", "vellore": "Vellore", "india": "India",
     "chennai": "Chennai", "tamil nadu": "Tamil Nadu", "vit": "VIT",
-    "vit vellore": "VIT Vellore", "java": "Java", "python": "Python",
+    "java": "Java", "python": "Python",
 }
 
 
-def protect_proper_nouns(text):
+def protect_names(text):
+    """Replace known names with safe alphabetic tokens, then restore them later."""
     protected = text
-    placeholders = {}
+    replacements = {}
     for index, (name, proper) in enumerate(sorted(PROPER_NOUNS.items(), key=lambda x: -len(x[0]))):
-        placeholder = f"__POLYWRITE_NAME_{index}__"
-        if re.search(r"\b" + re.escape(name) + r"\b", protected, re.IGNORECASE):
-            protected = re.sub(r"\b" + re.escape(name) + r"\b", placeholder, protected, flags=re.IGNORECASE)
-            placeholders[placeholder] = proper
-    return protected, placeholders
+        token = f"PolyName{index}X"
+        pattern = r"\b" + re.escape(name) + r"\b"
+        if re.search(pattern, protected, re.IGNORECASE):
+            protected = re.sub(pattern, token, protected, flags=re.IGNORECASE)
+            replacements[token] = proper
+    return protected, replacements
 
 
-def restore_proper_nouns(text, placeholders):
-    for placeholder, proper in placeholders.items():
-        text = text.replace(placeholder, proper)
+def restore_names(text, replacements):
+    for token, proper in replacements.items():
+        text = re.sub(r"\b" + re.escape(token) + r"\b", proper, text)
     return text
 
 
-def custom_analyze(text):
+def custom_rules(text):
     issues = []
     corrected = text
 
-    # Common learner omissions that a generic spell/grammar engine may miss.
-    patterns = [
-        (r"\bI\s+from\s+([A-Za-z]+)\b", lambda m: f"I am from {m.group(1)}", "Use 'am' after I."),
-        (r"\b(he|she)\s+from\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} is from {m.group(2)}", "Use 'is' after he/she."),
+    rules = [
+        (r"\bI\s+from\s+([A-Za-z]+)\b", lambda m: f"I am from {m.group(1)}", "Use 'am' after I when stating where you are from."),
+        (r"\b(he|she)\s+from\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} is from {m.group(2)}", "Use 'is' after he/she when stating where someone is from."),
         (r"\bI\s+a\s+([A-Za-z]+)\b", lambda m: f"I am a {m.group(1)}", "Use 'am' after I."),
         (r"\b(he|she)\s+a\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} is a {m.group(2)}", "Use 'is' after he/she."),
+        (r"\bmy\s+name\s+([A-Za-z]+)\b", lambda m: f"my name is {m.group(1)}", "Use 'is' in the expression 'my name is ...'."),
     ]
-    for pattern, make_suggestion, explanation in patterns:
+
+    for pattern, make_suggestion, explanation in rules:
         match = re.search(pattern, corrected, re.IGNORECASE)
         if match:
             original = match.group(0)
             suggestion = make_suggestion(match)
-            issues.append({"type": "grammar", "original": original, "suggestion": suggestion, "explanation": explanation, "rule": "POLYWRITE_MISSING_BE"})
+            # Preserve sentence-start capitalization.
+            if original[0].isupper():
+                suggestion = suggestion[0].upper() + suggestion[1:]
+            issues.append({
+                "type": "grammar",
+                "original": original,
+                "suggestion": suggestion,
+                "explanation": explanation,
+                "rule": "POLYWRITE_CUSTOM_GRAMMAR",
+            })
             corrected = corrected[:match.start()] + suggestion + corrected[match.end():]
 
-    # Capitalize sentence starts and the pronoun I.
+    # Capitalize sentence starts and the pronoun I before LanguageTool runs.
     corrected = re.sub(r"(^|(?<=[.!?])\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), corrected)
     corrected = re.sub(r"\bi\b", "I", corrected)
     return issues, corrected
 
 
 def analyze_english(text: str):
-    custom_issues, custom_corrected = custom_analyze(text)
-    protected, placeholders = protect_proper_nouns(custom_corrected)
-    matches = tool.check(protected)
-    issues = custom_issues[:]
+    custom_issues, custom_corrected = custom_rules(text)
 
-    # Apply LanguageTool suggestions from right to left.
-    corrected_protected = protected
-    for match in sorted(matches, key=lambda m: m.offset, reverse=True):
+    # Protect known names/places from LanguageTool spelling corrections.
+    protected, replacements = protect_names(custom_corrected)
+    matches = tool.check(protected)
+    corrected = language_tool_python.utils.correct(protected, matches)
+    corrected = restore_names(corrected, replacements)
+
+    issues = custom_issues[:]
+    for match in matches:
         original = protected[match.offset:match.offset + match.errorLength]
         replacement = match.replacements[0] if match.replacements else ""
-        rule_id = getattr(match, "ruleId", "") or ""
-        category = getattr(match, "category", "") or ""
-        if not replacement or "__POLYWRITE_NAME_" in original or "__POLYWRITE_NAME_" in replacement:
+        if not replacement or "PolyName" in original or "PolyName" in replacement:
             continue
-        category_upper = category.upper()
-        if "TYPOS" in category_upper or "SPELL" in rule_id.upper() or "MORFOLOGIK" in rule_id.upper():
+
+        rule_id = getattr(match, "ruleId", "") or ""
+        category = (getattr(match, "category", "") or "").upper()
+        if "TYPOS" in category or "SPELL" in rule_id.upper() or "MORFOLOGIK" in rule_id.upper() or "I_LOWERCASE" in rule_id.upper():
             issue_type = "spelling"
-        elif "STYLE" in category_upper or "REDUND" in rule_id.upper():
+        elif "STYLE" in category or "STYLE" in rule_id.upper() or "REDUND" in rule_id.upper():
             issue_type = "clarity"
         else:
             issue_type = "grammar"
-        issues.append({"type": issue_type, "original": original, "suggestion": replacement, "explanation": match.message, "rule": rule_id})
-        corrected_protected = corrected_protected[:match.offset] + replacement + corrected_protected[match.offset + match.errorLength:]
 
-    corrected = restore_proper_nouns(corrected_protected, placeholders)
+        issues.append({
+            "type": issue_type,
+            "original": original,
+            "suggestion": replacement,
+            "explanation": match.message,
+            "rule": rule_id,
+        })
 
-    # Protect custom fixes from accidental reversion and normalize known names.
-    for name, proper in PROPER_NOUNS.items():
-        corrected = re.sub(r"\b" + re.escape(name) + r"\b", proper, corrected, flags=re.IGNORECASE)
+    # Always restore/correct known proper nouns in the final output.
+    corrected = restore_names(corrected, replacements)
+    corrected = re.sub(r"\bi\b", "I", corrected)
 
-    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
-    for sentence in sentences:
+    # Add clarity warning for very long sentences.
+    for sentence in re.split(r"[.!?]+", text):
         if len(re.findall(r"\b[\w']+\b", sentence)) > 35:
-            issues.append({"type": "clarity", "original": "Long sentence", "suggestion": "Consider splitting this into shorter sentences.", "explanation": "Shorter sentences are usually easier to read.", "rule": "POLYWRITE_LONG_SENTENCE"})
+            issues.append({
+                "type": "clarity",
+                "original": "Long sentence",
+                "suggestion": "Consider splitting this into shorter sentences.",
+                "explanation": "Shorter sentences are usually easier to read.",
+                "rule": "POLYWRITE_LONG_SENTENCE",
+            })
+            break
 
+    # Remove duplicate findings.
     unique = []
     seen = set()
     for issue in issues:
@@ -107,9 +133,11 @@ def analyze_english(text: str):
             unique.append(issue)
     return unique, corrected
 
+
 @app.get("/")
 def root():
-    return {"message": "PolyWrite API is running", "engine": "LanguageTool + PolyWrite"}
+    return {"message": "PolyWrite API is running", "engine": "LanguageTool + PolyWrite rules"}
+
 
 @app.post("/analyze")
 def analyze(request: TextRequest):
@@ -121,4 +149,13 @@ def analyze(request: TextRequest):
     word_count = len(re.findall(r"\b[\w']+\b", text))
     sentence_count = len([s for s in re.split(r"[.!?]+", text) if s.strip()])
     score = max(0, min(100, 100 - len(grammar) * 8 - len(spelling) * 5 - len(clarity) * 3))
-    return {"text": text, "corrected_text": corrected_text, "issues": issues, "counts": {"grammar": len(grammar), "spelling": len(spelling), "clarity": len(clarity), "total": len(issues)}, "stats": {"words": word_count, "characters": len(text), "sentences": sentence_count}, "score": score, "message": "Analysis complete" if issues else "No issues found"}
+
+    return {
+        "text": text,
+        "corrected_text": corrected_text,
+        "issues": issues,
+        "counts": {"grammar": len(grammar), "spelling": len(spelling), "clarity": len(clarity), "total": len(issues)},
+        "stats": {"words": word_count, "characters": len(text), "sentences": sentence_count},
+        "score": score,
+        "message": "Analysis complete" if issues else "No issues found",
+    }
