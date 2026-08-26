@@ -1,12 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
-import json
 import re
 import logging
 import language_tool_python
-from anthropic import Anthropic
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("polywrite")
@@ -20,125 +17,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class TextRequest(BaseModel):
     text: str
 
-# -----------------------------------------------------------------------------
-# AI grammar engine
-# -----------------------------------------------------------------------------
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-LLM_MODEL = os.environ.get("POLYWRITE_LLM_MODEL", "claude-sonnet-4-6")
-_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-LLM_SYSTEM_PROMPT = """
-You are PolyWrite, a professional English writing assistant.
-Analyze the user's English as a whole, using sentence context rather than isolated
-word substitutions. Find genuine problems in grammar, spelling, punctuation,
-word choice, sentence structure, and clarity. Do not invent errors.
-
-Important:
-- Preserve names, places, colleges, companies, technical terms, and other proper
-  nouns exactly unless the user clearly misspells them.
-- Examples of proper nouns that may appear: Sourish, Kamal, Vellore, Tamil Nadu,
-  India, VIT, Java, Python.
-- Correct capitalization of names and the pronoun I when appropriate.
-- Understand learner English such as "I Kamal from Vellore" and infer the intended
-  sentence "I am Kamal from Vellore".
-- Prefer natural, minimal corrections. Do not rewrite a sentence just for style
-  when it is already grammatically acceptable.
-- Return ONLY valid JSON. No markdown fences and no extra text.
-
-JSON format:
-{
-  "corrected_text": "fully corrected version",
-  "issues": [
-    {
-      "type": "grammar|spelling|clarity",
-      "original": "exact problematic text",
-      "suggestion": "replacement",
-      "explanation": "short learner-friendly explanation",
-      "rule": "short rule name"
-    }
-  ]
-}
-"""
-
-
-def call_llm_grammar_check(text: str):
-    """Return (issues, corrected_text), or None when AI analysis is unavailable."""
-    if _client is None:
-        return None
-
-    try:
-        response = _client.messages.create(
-            model=LLM_MODEL,
-            max_tokens=2500,
-            temperature=0,
-            system=LLM_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": text}],
-        )
-        raw = "".join(
-            block.text for block in response.content
-            if getattr(block, "type", None) == "text"
-        ).strip()
-
-        # Be tolerant if a model ever surrounds JSON with whitespace/fences.
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw)
-        data = json.loads(raw)
-
-        corrected = data.get("corrected_text", text)
-        issues = data.get("issues", [])
-        if not isinstance(corrected, str) or not isinstance(issues, list):
-            raise ValueError("Invalid PolyWrite LLM response shape")
-
-        cleaned = []
-        for issue in issues:
-            if not isinstance(issue, dict):
-                continue
-            issue_type = issue.get("type", "grammar")
-            if issue_type not in {"grammar", "spelling", "clarity"}:
-                issue_type = "grammar"
-            original = str(issue.get("original", "")).strip()
-            suggestion = str(issue.get("suggestion", "")).strip()
-            explanation = str(issue.get("explanation", "")).strip()
-            if not original or not suggestion or not explanation:
-                continue
-            cleaned.append({
-                "type": issue_type,
-                "original": original,
-                "suggestion": suggestion,
-                "explanation": explanation,
-                "rule": str(issue.get("rule", "POLYWRITE_AI")),
-            })
-
-        return cleaned, corrected
-    except Exception as exc:
-        logger.warning("AI grammar check failed; using local fallback: %s", exc)
-        return None
-
-# -----------------------------------------------------------------------------
-# Local fallback engine
-# -----------------------------------------------------------------------------
+# LanguageTool is the main local grammar engine. It covers grammar, spelling,
+# punctuation, agreement, word choice, sentence structure and many other rules.
 tool = language_tool_python.LanguageTool("en-US")
 
+# Common names/places/technical terms that an English dictionary may flag.
+# This is a small protection list, not the grammar engine itself.
 PROPER_NOUNS = {
-    "sourish": "Sourish", "vellore": "Vellore", "india": "India",
-    "chennai": "Chennai", "tamil nadu": "Tamil Nadu", "vit": "VIT",
-    "java": "Java", "python": "Python",
+    "sourish": "Sourish",
+    "kamal": "Kamal",
+    "vellore": "Vellore",
+    "chennai": "Chennai",
+    "bangalore": "Bangalore",
+    "bengaluru": "Bengaluru",
+    "hyderabad": "Hyderabad",
+    "tamil nadu": "Tamil Nadu",
+    "india": "India",
+    "vit": "VIT",
+    "java": "Java",
+    "python": "Python",
+    "javascript": "JavaScript",
 }
 
-IRREGULAR_PLURALS = {
-    "person": "people", "child": "children", "man": "men", "woman": "women",
-    "mouse": "mice", "foot": "feet", "tooth": "teeth", "goose": "geese",
-}
 
-
-def protect_names(text):
+def protect_proper_nouns(text: str):
     protected = text
     replacements = {}
-    for index, (name, proper) in enumerate(sorted(PROPER_NOUNS.items(), key=lambda x: -len(x[0]))):
-        token = f"POLYNAME{index}X"
+    for index, (name, proper) in enumerate(
+        sorted(PROPER_NOUNS.items(), key=lambda item: -len(item[0]))
+    ):
+        token = f"POLYNAME{index}TOKEN"
         pattern = r"\b" + re.escape(name) + r"\b"
         if re.search(pattern, protected, re.IGNORECASE):
             protected = re.sub(pattern, token, protected, flags=re.IGNORECASE)
@@ -146,13 +59,13 @@ def protect_names(text):
     return protected, replacements
 
 
-def restore_names(text, replacements):
+def restore_proper_nouns(text: str, replacements):
     for token, proper in replacements.items():
         text = re.sub(r"\b" + re.escape(token) + r"\b", proper, text, flags=re.IGNORECASE)
     return text
 
 
-def preserve_case(original, suggestion):
+def preserve_case(original: str, suggestion: str):
     if not suggestion:
         return suggestion
     if original.isupper():
@@ -162,105 +75,163 @@ def preserve_case(original, suggestion):
     return suggestion
 
 
-def analyze_english_legacy(text: str):
-    issues = []
+def add_issue(issues, issue_type, original, suggestion, explanation, rule):
+    if not original or not suggestion or original == suggestion:
+        return
+    key = (issue_type, original.lower(), suggestion.lower())
+    if any((i["type"], i["original"].lower(), i["suggestion"].lower()) == key for i in issues):
+        return
+    issues.append({
+        "type": issue_type,
+        "original": original,
+        "suggestion": suggestion,
+        "explanation": explanation,
+        "rule": rule,
+    })
+
+
+def apply_context_rules(text: str, issues):
+    """Handle a few high-value learner-English patterns before LanguageTool.
+
+    These are structural patterns, not sentence-specific fixes. They mainly help
+    with omitted forms of 'be' that LanguageTool cannot always infer from context.
+    """
     corrected = text
 
-    rules = [
-        (r"\b(I)\s+(?:[A-Za-z]+\s+)?from\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} am {m.group(0).split()[1] if len(m.group(0).split()) > 3 else ''} from {m.group(2)}".replace("  ", " "), "Use 'am' after I when stating where you are from."),
-        (r"\b(he|she|it)\s+(?:[A-Za-z]+\s+)?from\s+([A-Za-z]+)\b", lambda m: f"{m.group(1)} is {m.group(0).split()[1] if len(m.group(0).split()) > 3 else ''} from {m.group(2)}".replace("  ", " "), "Use 'is' after he/she/it when stating where someone is from."),
-        (r"\bmy\s+name\s+([A-Za-z]+)\b", lambda m: f"my name is {m.group(1)}", "Use 'is' in the expression 'my name is ...'."),
-        (r"\b(he|she|it)\s+dont\b", lambda m: f"{m.group(1)} doesn't", "Use 'doesn't' with he/she/it."),
-        (r"\b(I|you|we|they)\s+doesnt\b", lambda m: f"{m.group(1)} don't", "Use 'don't' with I/you/we/they."),
-        (r"\b(he|she|it)\s+doesnt\b", lambda m: f"{m.group(1)} doesn't", "Use the apostrophe in 'doesn't'."),
-        (r"\b(he|she|it)\s+have\b", lambda m: f"{m.group(1)} has", "Use 'has' with he/she/it."),
-        (r"\b(I|you|we|they)\s+has\b", lambda m: f"{m.group(1)} have", "Use 'have' with I/you/we/they."),
-        (r"\b(he|she|it)\s+do\b", lambda m: f"{m.group(1)} does", "Use 'does' with he/she/it."),
-        (r"\b(he|she|it)\s+go\b", lambda m: f"{m.group(1)} goes", "Use 'goes' with he/she/it in the present tense."),
-        (r"\b(he|she|it)\s+like\b", lambda m: f"{m.group(1)} likes", "Use 'likes' with he/she/it in the present tense."),
-        (r"\b(he|she|it)\s+play\b", lambda m: f"{m.group(1)} plays", "Use 'plays' with he/she/it in the present tense."),
-        (r"\b(he|she|it)\s+work\b", lambda m: f"{m.group(1)} works", "Use 'works' with he/she/it in the present tense."),
-        (r"\b(he|she|it)\s+eat\b", lambda m: f"{m.group(1)} eats", "Use 'eats' with he/she/it in the present tense."),
-        (r"\b(he|she|it)\s+want\b", lambda m: f"{m.group(1)} wants", "Use 'wants' with he/she/it in the present tense."),
-        (r"\b(he|she|it)\s+need\b", lambda m: f"{m.group(1)} needs", "Use 'needs' with he/she/it in the present tense."),
-        (r"\b(he|she|it)\s+study\b", lambda m: f"{m.group(1)} studies", "Use 'studies' with he/she/it in the present tense."),
-        (r"\b(he|she|it)\s+were\b", lambda m: f"{m.group(1)} was", "Use 'was' with he/she/it."),
-        (r"\b(he|she|it)\s+don't\b", lambda m: f"{m.group(1)} doesn't", "Use 'doesn't' with he/she/it."),
-        (r"\b(he|she|it)\s+doesn't\s+([A-Za-z]+)s\b", lambda m: f"{m.group(1)} doesn't {m.group(2)}", "After 'doesn't', use the base form of the verb."),
-        (r"\b(I|you|we|they)\s+don't\s+([A-Za-z]+)s\b", lambda m: f"{m.group(1)} don't {m.group(2)}", "After 'don't', use the base form of the verb."),
-    ]
-
-    for pattern, make_suggestion, explanation in rules:
-        match = re.search(pattern, corrected, re.IGNORECASE)
-        if not match:
+    # "my name Sourish" -> "my name is Sourish"
+    pattern = r"\b(my\s+name)\s+([A-Za-z][A-Za-z'-]*)\b"
+    for match in list(re.finditer(pattern, corrected, re.IGNORECASE)):
+        name = match.group(2)
+        if name.lower() in {"is", "was", "has"}:
             continue
         original = match.group(0)
-        suggestion = preserve_case(original, make_suggestion(match))
-        if suggestion.lower() == original.lower():
+        suggestion = f"{match.group(1)} is {name}"
+        add_issue(
+            issues, "grammar", original, suggestion,
+            "Use 'is' in the expression 'my name is ...'.",
+            "POLYWRITE_MISSING_BE",
+        )
+        corrected = corrected.replace(original, suggestion, 1)
+
+    # "I Kamal from Vellore" / "I am Kamal from Vellore"
+    # The first form is common learner English: subject + name + from-place.
+    pattern = r"\b(i)\s+([A-Za-z][A-Za-z'-]*)\s+from\s+([A-Za-z][A-Za-z'-]*)\b"
+    for match in list(re.finditer(pattern, corrected, re.IGNORECASE)):
+        original = match.group(0)
+        subject, name, place = match.groups()
+        if name.lower() in {"am", "was", "have", "live"}:
             continue
-        issues.append({
-            "type": "grammar", "original": original, "suggestion": suggestion,
-            "explanation": explanation, "rule": "POLYWRITE_CUSTOM_GRAMMAR",
-        })
-        corrected = corrected[:match.start()] + suggestion + corrected[match.end():]
+        suggestion = f"{subject} am {name} from {place}"
+        add_issue(
+            issues, "grammar", original, suggestion,
+            "Use 'am' after I when introducing yourself and stating where you are from.",
+            "POLYWRITE_MISSING_BE",
+        )
+        corrected = corrected.replace(original, suggestion, 1)
 
-    protected, replacements = protect_names(corrected)
-    matches = tool.check(protected)
-    corrected = language_tool_python.utils.correct(protected, matches)
-    corrected = restore_names(corrected, replacements)
-
-    for match in matches:
-        original = protected[match.offset:match.offset + match.errorLength]
-        replacement = match.replacements[0] if match.replacements else ""
-        if not replacement or "POLYNAME" in original or "POLYNAME" in replacement:
+    # "he/she Name from Place" -> "he/she is Name from Place"
+    pattern = r"\b(he|she)\s+([A-Za-z][A-Za-z'-]*)\s+from\s+([A-Za-z][A-Za-z'-]*)\b"
+    for match in list(re.finditer(pattern, corrected, re.IGNORECASE)):
+        original = match.group(0)
+        subject, name, place = match.groups()
+        if name.lower() in {"is", "was", "has"}:
             continue
-        rule_id = getattr(match, "ruleId", "") or ""
-        upper = rule_id.upper()
-        issue_type = "spelling" if "SPELL" in upper or "MORFOLOGIK" in upper else "grammar"
-        issues.append({
-            "type": issue_type, "original": original,
-            "suggestion": preserve_case(original, replacement),
-            "explanation": match.message, "rule": rule_id,
-        })
+        suggestion = f"{subject} is {name} from {place}"
+        add_issue(
+            issues, "grammar", original, suggestion,
+            "Use 'is' after he/she when introducing someone and stating where they are from.",
+            "POLYWRITE_MISSING_BE",
+        )
+        corrected = corrected.replace(original, suggestion, 1)
 
-    corrected = re.sub(r"(^|(?<=[.!?])\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), corrected)
-    corrected = re.sub(r"\bi\b", "I", corrected)
-    return issues, corrected
+    return corrected
 
 
 def analyze_english(text: str):
-    # AI is the primary engine. The local engine remains a safe fallback.
-    result = call_llm_grammar_check(text)
-    if result is not None:
-        return result
-    return analyze_english_legacy(text)
+    issues = []
+    corrected = apply_context_rules(text, issues)
+
+    # Protect known proper nouns while LanguageTool analyzes the rest.
+    protected, replacements = protect_proper_nouns(corrected)
+    matches = tool.check(protected)
+    language_corrected = language_tool_python.utils.correct(protected, matches)
+    language_corrected = restore_proper_nouns(language_corrected, replacements)
+
+    # Convert LanguageTool matches into PolyWrite's unified issue format.
+    for match in matches:
+        original = protected[match.offset:match.offset + match.errorLength]
+        replacement = match.replacements[0] if match.replacements else ""
+        if not replacement:
+            continue
+        if "POLYNAME" in original or "POLYNAME" in replacement:
+            continue
+
+        rule_id = getattr(match, "ruleId", "") or "LANGUAGETOOL"
+        upper_rule = rule_id.upper()
+        issue_type = "spelling" if any(
+            marker in upper_rule for marker in ("SPELL", "MORFOLOGIK", "TYPOS")
+        ) else "grammar"
+
+        add_issue(
+            issues,
+            issue_type,
+            original,
+            preserve_case(original, replacement),
+            match.message,
+            rule_id,
+        )
+
+    corrected = language_corrected
+
+    # Final universal capitalization cleanup.
+    corrected = re.sub(
+        r"(^|(?<=[.!?])\s+)([a-z])",
+        lambda m: m.group(1) + m.group(2).upper(),
+        corrected,
+    )
+    corrected = re.sub(r"\bi\b", "I", corrected)
+
+    # Capitalization corrections are already represented by LanguageTool in most
+    # cases; don't create duplicate issues merely because we normalize the text.
+    return issues, corrected
 
 
 @app.get("/")
 def root():
-    return {"message": "PolyWrite API is running", "engine": "AI + LanguageTool fallback"}
+    return {"message": "PolyWrite API is running", "engine": "LanguageTool + PolyWrite context rules"}
 
 
 @app.post("/analyze")
 def analyze(request: TextRequest):
     text = request.text.strip()
     issues, corrected_text = analyze_english(text)
+
     grammar = [i for i in issues if i["type"] == "grammar"]
     spelling = [i for i in issues if i["type"] == "spelling"]
     clarity = [i for i in issues if i["type"] == "clarity"]
+
     word_count = len(re.findall(r"\b[\w']+\b", text))
     sentence_count = len([s for s in re.split(r"[.!?]+", text) if s.strip()])
-    score = max(0, min(100, 100 - len(grammar) * 8 - len(spelling) * 5 - len(clarity) * 3))
+    score = max(
+        0,
+        min(100, 100 - len(grammar) * 8 - len(spelling) * 5 - len(clarity) * 3),
+    )
 
     return {
         "text": text,
         "corrected_text": corrected_text,
         "issues": issues,
         "counts": {
-            "grammar": len(grammar), "spelling": len(spelling),
-            "clarity": len(clarity), "total": len(issues),
+            "grammar": len(grammar),
+            "spelling": len(spelling),
+            "clarity": len(clarity),
+            "total": len(issues),
         },
-        "stats": {"words": word_count, "characters": len(text), "sentences": sentence_count},
+        "stats": {
+            "words": word_count,
+            "characters": len(text),
+            "sentences": sentence_count,
+        },
         "score": score,
         "message": "Analysis complete" if issues else "No issues found",
     }
