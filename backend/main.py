@@ -5,8 +5,6 @@ import re
 
 app = FastAPI(title="PolyWrite API")
 
-# The frontend normally reaches this API through the Vite /api proxy.
-# CORS is also enabled for direct development requests.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,7 +32,9 @@ def analyze_english(text: str):
     issues = []
     words = re.findall(r"\b[\w']+\b", text)
 
-    # Past-time rules come first so "He go ... yesterday" becomes "He went".
+    # Check past-time expressions first. This prevents the present-tense
+    # rule from changing "He go" to "He goes" when "yesterday/last/ago"
+    # clearly requires "went".
     past_patterns = [
         (r"\b(he|she|it) go\b(?=\s+(?:yesterday|last\b|ago\b))", "went", "Use the past tense 'went' with a past-time expression."),
         (r"\b(I|you|we|they) go\b(?=\s+(?:yesterday|last\b|ago\b))", "went", "Use the past tense 'went' with a past-time expression."),
@@ -57,6 +57,8 @@ def analyze_english(text: str):
                 "explanation": explanation,
             })
 
+    # Present-tense subject/verb agreement is checked only when the same
+    # verb phrase was not already identified as a past-tense construction.
     grammar_rules = [
         (r"\b(I|you|we|they) is\b", "are", "Use 'are' with I/you/we/they."),
         (r"\b(he|she|it) are\b", "is", "Use 'is' with he/she/it."),
