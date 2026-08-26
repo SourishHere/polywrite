@@ -14,8 +14,8 @@ COMMON_MISSPELLINGS = {
     "becuase":"because","alot":"a lot","wich":"which","langauge":"language","grammer":"grammar","wierd":"weird",
     "adress":"address","enviroment":"environment","succesful":"successful","goverment":"government","acheive":"achieve",
     "begining":"beginning","beleive":"believe","calender":"calendar","definate":"definite","occassion":"occasion",
-    "tomorow":"tomorrow","tommorow":"tomorrow","recieve":"receive","untill":"until","thier":"their","freind":"friend",
-    "arguement":"argument","comming":"coming","wich":"which","writting":"writing","seperately":"separately"
+    "tomorow":"tomorrow","tommorow":"tomorrow","thier":"their","freind":"friend","arguement":"argument",
+    "comming":"coming","writting":"writing","seperately":"separately","recieve":"receive"
 }
 
 PAST_RULES = [
@@ -27,19 +27,24 @@ PAST_RULES = [
 ]
 
 GRAMMAR_RULES = [
-    (r"\b(I) is\b", "am", "Use 'am' with I."),
+    (r"\bI is\b", "am", "Use 'am' with I."),
     (r"\b(I|you|we|they) is\b", "are", "Use 'are' with I/you/we/they."),
     (r"\b(he|she|it) are\b", "is", "Use 'is' with he/she/it."),
     (r"\b(he|she|it) go\b", "goes", "Use 'goes' with he/she/it in the present tense."),
     (r"\b(he|she|it) do\b", "does", "Use 'does' with he/she/it in the present tense."),
     (r"\b(he|she|it) have\b", "has", "Use 'has' with he/she/it."),
     (r"\b(he|she|it) don't\b", "doesn't", "Use 'doesn't' with he/she/it."),
+    (r"\b(he|she|it) dont\b", "doesn't", "Use 'doesn't' with he/she/it."),
     (r"\b(I|you|we|they) doesn't\b", "don't", "Use 'don't' with I/you/we/they."),
+    (r"\b(I|you|we|they) doesnt\b", "don't", "Use 'don't' with I/you/we/they."),
     (r"\b(he|she|it) were\b", "was", "Use 'was' with he/she/it."),
-    (r"\b(I|he|she|it) were\b", "was", "Use 'was' with a singular subject."),
     (r"\b(you|we|they) was\b", "were", "Use 'were' with you/we/they."),
     (r"\b(I|you|we|they) has\b", "have", "Use 'have' with I/you/we/they."),
-    (r"\b(a)\s+([aeiouAEIOU][\w']*)", None, "Use 'an' before a vowel sound."),
+    (r"\b(he|she|it) need\b", "needs", "Use 'needs' with he/she/it."),
+    (r"\b(he|she|it) like\b", "likes", "Use 'likes' with he/she/it."),
+    (r"\b(he|she|it) want\b", "wants", "Use 'wants' with he/she/it."),
+    (r"\b(he|she|it) play\b", "plays", "Use 'plays' with he/she/it."),
+    (r"\b(he|she|it) study\b", "studies", "Use 'studies' with he/she/it."),
 ]
 
 
@@ -60,7 +65,7 @@ def analyze_english(text: str):
         if match:
             original = match.group(0)
             subject = original.rsplit(" ", 1)[0]
-            suggestion = f"{subject} {replacement}"
+            suggestion = f"{subject} {replacement_case(original.rsplit(' ',1)[-1], replacement)}"
             key = (original.lower(), suggestion.lower())
             if key not in used:
                 used.add(key)
@@ -71,15 +76,9 @@ def analyze_english(text: str):
         match = re.search(pattern, corrected, re.IGNORECASE)
         if not match: continue
         original = match.group(0)
-        if replacement is None:
-            article, next_word = match.group(1), match.group(2)
-            suggestion = "an " + next_word
-            start = match.start()
-            corrected = corrected[:start] + suggestion + corrected[match.end():]
-        else:
-            wrong_verb = original.split()[-1]
-            suggestion = re.sub(re.escape(wrong_verb), replacement_case(wrong_verb, replacement), original, count=1, flags=re.IGNORECASE)
-            corrected = corrected.replace(original, suggestion, 1)
+        wrong_word = original.split()[-1]
+        suggestion = re.sub(re.escape(wrong_word), replacement_case(wrong_word, replacement), original, count=1, flags=re.IGNORECASE)
+        corrected = corrected.replace(original, suggestion, 1)
         key = (original.lower(), suggestion.lower())
         if key not in used:
             used.add(key)
@@ -93,6 +92,19 @@ def analyze_english(text: str):
             suggestion = COMMON_MISSPELLINGS[lower]
             issues.append({"type":"spelling","original":word,"suggestion":suggestion,"explanation":"Check the spelling of this word."})
             corrected = re.sub(r"\b" + re.escape(word) + r"\b", suggestion, corrected, count=1, flags=re.IGNORECASE)
+
+    # Simple countable-noun agreement checks.
+    plural_triggers = ["many", "several", "few", "numerous", "two", "three", "four", "five"]
+    for trigger in plural_triggers:
+        match = re.search(r"\b" + trigger + r"\s+([a-zA-Z]+)\b", corrected, re.IGNORECASE)
+        if match:
+            noun = match.group(1)
+            if noun.lower() in {"email", "book", "car", "student", "apple", "class", "problem", "idea", "question", "message", "day", "word", "sentence", "friend", "movie", "file"}:
+                suggestion_noun = noun + ("es" if noun.lower().endswith(("s","x","z","ch","sh")) else "s")
+                original = match.group(0)
+                suggestion = f"{trigger} {suggestion_noun}"
+                issues.append({"type":"grammar","original":original,"suggestion":suggestion,"explanation":f"Use the plural form '{suggestion_noun}' after '{trigger}'."})
+                corrected = corrected[:match.start()] + suggestion + corrected[match.end():]
 
     sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
     for sentence in sentences:
@@ -116,11 +128,10 @@ def analyze(request: TextRequest):
     clarity = [i for i in issues if i["type"] == "clarity"]
     word_count = len(re.findall(r"\b[\w']+\b", text))
     sentence_count = len([s for s in re.split(r"[.!?]+", text) if s.strip()])
-    total = len(issues)
-    score = max(0, min(100, 100 - grammar.__len__()*8 - spelling.__len__()*5 - clarity.__len__()*3))
+    score = max(0, min(100, 100 - len(grammar)*8 - len(spelling)*5 - len(clarity)*3))
     return {
         "text":text,"corrected_text":corrected_text,"issues":issues,
-        "counts":{"grammar":len(grammar),"spelling":len(spelling),"clarity":len(clarity),"total":total},
+        "counts":{"grammar":len(grammar),"spelling":len(spelling),"clarity":len(clarity),"total":len(issues)},
         "stats":{"words":word_count,"characters":len(text),"sentences":sentence_count},
         "score":score,
         "message":"Analysis complete" if issues else "No issues found"
