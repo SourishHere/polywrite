@@ -55,7 +55,6 @@ def add_issue(issues, issue_type, original, suggestion, explanation, rule):
 def apply_context_rules(text: str, issues):
     corrected = text
 
-    # Only match "my name <name>" when <name> is NOT already a linking verb.
     pattern = r"\b(my\s+name)\s+(?!is\b|was\b|has\b)([A-Za-z][A-Za-z'-]*)\b"
     for match in list(re.finditer(pattern, corrected, re.IGNORECASE)):
         original = match.group(0)
@@ -77,25 +76,34 @@ def apply_context_rules(text: str, issues):
 
 def analyze_english(text: str):
     issues = []
-    corrected = apply_context_rules(text, issues)
-    protected, replacements = protect_proper_nouns(corrected)
-    model_corrected = improve_text(protected)
-    model_corrected = restore_proper_nouns(model_corrected, replacements)
-    lt_input = model_corrected if model_corrected else corrected
-    protected_lt, replacements_lt = protect_proper_nouns(lt_input)
-    matches = tool.check(protected_lt)
-    lt_corrected = restore_proper_nouns(language_tool_python.utils.correct(protected_lt, matches), replacements_lt)
-    corrected = model_corrected if model_corrected and model_corrected != protected else corrected
+
+    # Detect problems against the ORIGINAL text. The previous implementation
+    # checked LanguageTool after the Transformer had already corrected the text,
+    # which made real mistakes disappear from the issue list and produced 100s.
+    context_corrected = apply_context_rules(text, issues)
+
+    protected_original, replacements = protect_proper_nouns(text)
+    matches = tool.check(protected_original)
+
     for match in matches:
-        original = protected_lt[match.offset:match.offset + match.errorLength]
+        original = protected_original[match.offset:match.offset + match.errorLength]
         replacement = match.replacements[0] if match.replacements else ""
-        if not replacement or "POLYNAME" in original or "POLYNAME" in replacement: continue
+        if not replacement or "POLYNAME" in original or "POLYNAME" in replacement:
+            continue
         rule_id = getattr(match, "ruleId", "") or "LANGUAGETOOL"
         upper = rule_id.upper()
         issue_type = "spelling" if any(x in upper for x in ("SPELL", "MORFOLOGIK", "TYPO")) else "grammar"
-        add_issue(issues, issue_type, original, preserve_case(original, replacement), match.message, rule_id)
+        add_issue(issues, issue_type, restore_proper_nouns(original, replacements), preserve_case(original, replacement), match.message, rule_id)
+
+    # Generate the best corrected version from the context-aware text.
+    protected_context, context_replacements = protect_proper_nouns(context_corrected)
+    model_corrected = improve_text(protected_context)
+    corrected = restore_proper_nouns(model_corrected, context_replacements)
+
+    # Final presentation normalization.
     corrected = re.sub(r"(^|(?<=[.!?])\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), corrected)
     corrected = re.sub(r"\bi\b", "I", corrected)
+    corrected = re.sub(r"\s+([,.!?])", r"\1", corrected)
     return issues, corrected
 
 @app.get("/")
