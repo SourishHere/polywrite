@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import re
 import logging
+import os
+import json
+import urllib.request
+import urllib.error
 from difflib import SequenceMatcher
 import language_tool_python
 
@@ -18,6 +22,10 @@ class TextRequest(BaseModel):
     text: str
 
 tool = language_tool_python.LanguageTool("en-US")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 PROPER_NOUNS = {
     "sourish": "Sourish", "kamal": "Kamal", "vellore": "Vellore",
@@ -98,18 +106,66 @@ def apply_context_rules(text: str, issues):
     return corrected
 
 
-def add_model_differences(original: str, corrected: str, issues):
-    """Turn meaningful model corrections into Grammarly-style issue entries.
+def call_gemini(text: str):
+    """Ask Gemini for a natural correction while keeping output predictable.
 
-    LanguageTool is excellent for explicit rule matches, while the local T5
-    model can fix errors that LanguageTool misses. Comparing the original and
-    final text ensures those model-only corrections are still visible to the UI.
+    Returns (corrected_text, llm_issues) or (None, []) if Gemini is unavailable.
+    The API key is read only from the environment and is never stored in git.
     """
+    if not GEMINI_API_KEY:
+        return None, []
+
+    prompt = """You are PolyWrite, a professional English grammar and writing assistant.
+Correct the user's text while preserving the original meaning, names, places, technical terms, tone, and paragraph structure.
+Fix grammar, spelling, punctuation, capitalization, word choice when clearly incorrect, and awkward sentence construction.
+Do not invent facts or rewrite correct sentences unnecessarily.
+Return ONLY valid JSON with this exact shape:
+{
+  "corrected_text": "...",
+  "issues": [
+    {"type": "grammar|spelling|clarity", "original": "...", "suggestion": "...", "explanation": "..."}
+  ]
+}
+Each issue must correspond to a real change from the user's text. Keep issues concise and do not report mere stylistic preferences as errors.
+
+User text:
+""" + text
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json"
+        }
+    }
+    data = json.dumps(payload).encode("utf-8")
+    url = GEMINI_URL.format(model=GEMINI_MODEL) + "?key=" + urllib.parse.quote(GEMINI_API_KEY, safe="")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        raw = body["candidates"][0]["content"]["parts"][0]["text"]
+        result = json.loads(raw)
+        corrected = str(result.get("corrected_text", "")).strip()
+        llm_issues = result.get("issues", [])
+        if not corrected:
+            return None, []
+        return corrected, llm_issues if isinstance(llm_issues, list) else []
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Gemini unavailable; using local engine: %s", exc)
+        return None, []
+
+
+def add_model_differences(original: str, corrected: str, issues):
     if not corrected or original.strip() == corrected.strip():
         return
 
-    # Compare words rather than characters so an entire correction such as
-    # "go" -> "went" or "he dont likes" -> "he doesn't like" is one issue.
     old_words = re.findall(r"\b[\w']+\b", original)
     new_words = re.findall(r"\b[\w']+\b", corrected)
     matcher = SequenceMatcher(a=old_words, b=new_words, autojunk=False)
@@ -121,31 +177,47 @@ def add_model_differences(original: str, corrected: str, issues):
         new = " ".join(new_words[j1:j2])
         if not old or not new or old.lower() == new.lower():
             continue
-
-        # Avoid adding noisy entries for proper-noun capitalization that we
-        # intentionally normalize (Sourish/Vellore/Kamal, etc.).
         if old.lower() in PROPER_NOUNS and new.lower() == PROPER_NOUNS[old.lower()].lower():
             continue
-
         issue_type = "spelling" if len(old.split()) == 1 and len(new.split()) == 1 else "grammar"
-        explanation = (
-            "Possible spelling mistake." if issue_type == "spelling"
-            else "Grammar or sentence-structure correction suggested."
-        )
+        explanation = "Possible spelling mistake." if issue_type == "spelling" else "Grammar or sentence-structure correction suggested."
         add_issue(issues, issue_type, old, new, explanation, "POLYWRITE_MODEL_CORRECTION")
+
+
+def add_gemini_issues(issues, llm_issues, original):
+    for item in llm_issues:
+        if not isinstance(item, dict):
+            continue
+        issue_type = str(item.get("type", "grammar")).lower()
+        if issue_type not in {"grammar", "spelling", "clarity"}:
+            issue_type = "grammar"
+        original_part = str(item.get("original", "")).strip()
+        suggestion = str(item.get("suggestion", "")).strip()
+        explanation = str(item.get("explanation", "Grammar correction." )).strip()
+        if original_part and suggestion and original_part.lower() != suggestion.lower() and original_part.lower() in original.lower():
+            add_issue(issues, issue_type, original_part, suggestion, explanation, "GEMINI")
 
 
 def analyze_english(text: str):
     issues = []
 
-    # First apply small high-confidence PolyWrite rules. These are also used as
-    # input to the local model so the model receives cleaner context.
-    context_corrected = apply_context_rules(text, issues)
+    # Gemini is the primary natural-language engine when a key is configured.
+    gemini_corrected, gemini_issues = call_gemini(text)
+    if gemini_corrected:
+        corrected = gemini_corrected
+        add_gemini_issues(issues, gemini_issues, text)
+        engine = "Gemini + LanguageTool"
+    else:
+        context_corrected = apply_context_rules(text, issues)
+        protected_context, context_replacements = protect_proper_nouns(context_corrected)
+        model_corrected = improve_text(protected_context)
+        corrected = restore_proper_nouns(model_corrected, context_replacements)
+        add_model_differences(text, corrected, issues)
+        engine = "Local Transformer + LanguageTool"
 
-    # LanguageTool checks the ORIGINAL text, not an already corrected version.
+    # LanguageTool verifies the original input so the user still gets precise rule explanations.
     protected_original, replacements = protect_proper_nouns(text)
     matches = tool.check(protected_original)
-
     for match in matches:
         original = protected_original[match.offset:match.offset + match.errorLength]
         replacement = match.replacements[0] if match.replacements else ""
@@ -154,43 +226,27 @@ def analyze_english(text: str):
         rule_id = getattr(match, "ruleId", "") or "LANGUAGETOOL"
         upper = rule_id.upper()
         issue_type = "spelling" if any(x in upper for x in ("SPELL", "MORFOLOGIK", "TYPO")) else "grammar"
-        add_issue(
-            issues,
-            issue_type,
-            restore_proper_nouns(original, replacements),
-            preserve_case(original, replacement),
-            match.message,
-            rule_id,
-        )
+        add_issue(issues, issue_type,
+                  restore_proper_nouns(original, replacements),
+                  preserve_case(original, replacement),
+                  match.message, rule_id)
 
-    # The local Transformer provides the broad, natural-language correction.
-    protected_context, context_replacements = protect_proper_nouns(context_corrected)
-    model_corrected = improve_text(protected_context)
-    corrected = restore_proper_nouns(model_corrected, context_replacements)
-
-    # Capture corrections the model found that LanguageTool did not report.
-    add_model_differences(text, corrected, issues)
-
-    # Final presentation normalization.
-    corrected = re.sub(
-        r"(^|(?<=[.!?])\s+)([a-z])",
-        lambda m: m.group(1) + m.group(2).upper(),
-        corrected,
-    )
+    corrected = restore_proper_nouns(corrected, replacements)
+    corrected = re.sub(r"(^|(?<=[.!?])\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), corrected)
     corrected = re.sub(r"\bi\b", "I", corrected)
     corrected = re.sub(r"\s+([,.!?])", r"\1", corrected)
-    return issues, corrected
+    return issues, corrected, engine
 
 
 @app.get("/")
 def root():
-    return {"message": "PolyWrite API is running", "engine": "Local Transformer + LanguageTool"}
+    return {"message": "PolyWrite API is running", "engine": "Gemini + LanguageTool + local fallback", "gemini_enabled": bool(GEMINI_API_KEY)}
 
 
 @app.post("/analyze")
 def analyze(request: TextRequest):
     text = request.text.strip()
-    issues, corrected_text = analyze_english(text)
+    issues, corrected_text, engine = analyze_english(text)
     grammar = [i for i in issues if i["type"] == "grammar"]
     spelling = [i for i in issues if i["type"] == "spelling"]
     clarity = [i for i in issues if i["type"] == "clarity"]
@@ -201,17 +257,9 @@ def analyze(request: TextRequest):
         "text": text,
         "corrected_text": corrected_text,
         "issues": issues,
-        "counts": {
-            "grammar": len(grammar),
-            "spelling": len(spelling),
-            "clarity": len(clarity),
-            "total": len(issues),
-        },
-        "stats": {
-            "words": word_count,
-            "characters": len(text),
-            "sentences": sentence_count,
-        },
+        "counts": {"grammar": len(grammar), "spelling": len(spelling), "clarity": len(clarity), "total": len(issues)},
+        "stats": {"words": word_count, "characters": len(text), "sentences": sentence_count},
         "score": score,
+        "engine": engine,
         "message": "Analysis complete" if issues else "No issues found",
     }
